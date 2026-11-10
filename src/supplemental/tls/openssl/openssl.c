@@ -7,6 +7,7 @@
 // found online at https://opensource.org/licenses/MIT.
 //
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -778,6 +779,44 @@ open_config_own_cert(nng_tls_engine_config *cfg, const char *cert,
 		log_error("NNG-TLS-CFG-OWNCHAIN" "Failed to set certificate to SSL_CTX");
 		rv = NNG_EINVAL;
 		goto error;
+	}
+
+	// cert contains the leaf followed by its intermediate certificates. Do
+	// not depend on the peer verification store to build our outgoing chain.
+	SSL_CTX_clear_extra_chain_certs(cfg->ctx);
+	while (BIO_ctrl_pending(biocert) > 0) {
+		char *remaining;
+		long remaining_len = BIO_get_mem_data(biocert, &remaining);
+		long offset = 0;
+		const char header[] = "-----BEGIN CERTIFICATE-----";
+		X509 *chain_cert;
+
+		while (offset < remaining_len &&
+		    isspace((unsigned char) remaining[offset])) {
+			offset++;
+		}
+		if (offset == remaining_len) {
+			break;
+		}
+		if (remaining_len - offset < (long) (sizeof(header) - 1) ||
+		    memcmp(remaining + offset, header, sizeof(header) - 1) != 0) {
+			log_error("NNG-TLS-CFG-OWNCHAIN" "Invalid trailing certificate data");
+			rv = NNG_EINVAL;
+			goto error;
+		}
+		chain_cert = PEM_read_bio_X509(biocert, NULL, 0, NULL);
+		if (chain_cert == NULL) {
+			log_error("NNG-TLS-CFG-OWNCHAIN" "Failed to load chain certificate");
+			rv = NNG_EINVAL;
+			goto error;
+		}
+		// OpenSSL takes ownership only when the certificate is added.
+		if (SSL_CTX_add_extra_chain_cert(cfg->ctx, chain_cert) <= 0) {
+			X509_free(chain_cert);
+			log_error("NNG-TLS-CFG-OWNCHAIN" "Failed to set chain certificate");
+			rv = NNG_EINVAL;
+			goto error;
+		}
 	}
 
 	len = strlen(key);
